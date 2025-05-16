@@ -1,56 +1,432 @@
-package chroot
+package jail
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 
+	"sysweaver/internal/config"
 	"sysweaver/internal/structures"
 )
 
 type Jail struct {
 	cmd        *exec.Cmd
-	config     structures.JailConf
+	config     structures.JailConfig
 	configPath string
 	running    bool
 	mutex      sync.Mutex
 	logWriter  io.Writer
+	mounts     []string // Для отслеживания смонтированных ФС
+
+	// Внутренние настройки изоляции
+	pidNamespace bool
+	uidMappings  []structures.IDMapping
+	gidMappings  []structures.IDMapping
 }
 
-func NewJail(configPath string) (*Jail, error) {
+func NewJail(configPath string, templatePath string) (*Jail, error) {
 	var jailConfig structures.JailConfig
 
-	err := config.LoadConfig(configPath, &jailConfig) // configPath - путь до файла конфигурации(путь до него, как правило, один и тот же, и привязан к структуре шаблона. можно будет указать его конкретно в общей конйигурации шаблона)
+	err := config.LoadConfig(configPath, &jailConfig)
 	if err != nil {
 		return nil, err
 	}
+
+	// Проверка обязательных полей
+	if jailConfig.ChrootDir == "" {
+		return nil, fmt.Errorf("chroot directory not specified in config")
+	}
+
+	if jailConfig.BuilderPath == "" {
+		return nil, fmt.Errorf("builder path not specified in config")
+	}
+
+	// Устанавливаем путь к шаблону из аргумента
+	jailConfig.TemplatePath = templatePath
+
 	return &Jail{
-		config:     jailConfig,
-		configPath: configPath,
-		running:    false,
-		logWriter:  os.Stdout,
+		config:       jailConfig,
+		configPath:   configPath,
+		running:      false,
+		logWriter:    os.Stdout,
+		mounts:       []string{},
+		pidNamespace: true,
+		uidMappings: []structures.IDMapping{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		},
+		gidMappings: []structures.IDMapping{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		},
 	}, nil
 }
 
-func (m *Manager) Start() error { // Заглушка
+// setupMounts настраивает точки монтирования для изолированной среды
+func (j *Jail) setupMounts() error {
+	// Проверяем существование BuilderPath
+	if _, err := os.Stat(j.config.BuilderPath); os.IsNotExist(err) {
+		return fmt.Errorf("builder path does not exist: %s", j.config.BuilderPath)
+	}
+
+	// Проверяем существование TemplatePath
+	if _, err := os.Stat(j.config.TemplatePath); os.IsNotExist(err) {
+		return fmt.Errorf("template path does not exist: %s", j.config.TemplatePath)
+	}
+
+	// Создаем chroot директорию
+	if err := os.MkdirAll(j.config.ChrootDir, 0755); err != nil {
+		return fmt.Errorf("failed to create chroot directory: %w", err)
+	}
+
+	// Создаем временную директорию для общего монтирования
+	// Обе директории (upperdir и workdir) будут находиться в одной точке монтирования
+	tmpMountBase := filepath.Join(os.TempDir(), "sysweaver-mount")
+
+	// Очищаем, если существует
+	if _, err := os.Stat(tmpMountBase); err == nil {
+		if err := os.RemoveAll(tmpMountBase); err != nil {
+			return fmt.Errorf("failed to clean temporary mount directory: %w", err)
+		}
+	}
+
+	// Создаем временную базу и поддиректории
+	upperDir := filepath.Join(tmpMountBase, "upper")
+	workDir := filepath.Join(tmpMountBase, "work")
+
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		return fmt.Errorf("failed to create upper directory: %w", err)
+	}
+
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return fmt.Errorf("failed to create work directory: %w", err)
+	}
+
+	// Копируем содержимое шаблона в upperDir
+	// Используем rsync или find+cp для копирования с сохранением прав
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("cp -a %s/* %s/ || true", j.config.TemplatePath, upperDir))
+	cmd.Stdout = j.logWriter
+	cmd.Stderr = j.logWriter
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(j.logWriter, "Warning: error copying template contents: %v\n", err)
+		// Продолжаем, даже если копирование не удалось полностью
+	}
+
+	// Монтируем overlay с обновленными параметрами
+	overlayOptions := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
+		j.config.BuilderPath,
+		upperDir,
+		workDir,
+	)
+
+	fmt.Fprintf(j.logWriter, "Mounting overlay with options: %s\n", overlayOptions)
+
+	// Используем mount команду
+	mountCmd := exec.Command("mount", "-t", "overlay", "overlay",
+		"-o", overlayOptions, j.config.ChrootDir)
+
+	mountCmd.Stdout = j.logWriter
+	mountCmd.Stderr = j.logWriter
+
+	if err := mountCmd.Run(); err != nil {
+		return fmt.Errorf("failed to mount overlay: %w", err)
+	}
+
+	j.mounts = append(j.mounts, j.config.ChrootDir)
+
+	// Монтируем специальные файловые системы
+	specialMounts := []struct {
+		source  string
+		target  string
+		fstype  string
+		options string
+	}{
+		{"/proc", filepath.Join(j.config.ChrootDir, "proc"), "proc", ""},
+		{"/sys", filepath.Join(j.config.ChrootDir, "sys"), "sysfs", ""},
+		{"/dev", filepath.Join(j.config.ChrootDir, "dev"), "devtmpfs", ""},
+		{"/dev/pts", filepath.Join(j.config.ChrootDir, "dev/pts"), "devpts", ""},
+	}
+
+	for _, m := range specialMounts {
+		targetDir := m.target
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("failed to create mount target %s: %w", targetDir, err)
+		}
+
+		mountCmd := exec.Command("mount", "-t", m.fstype, m.source, targetDir)
+		if m.options != "" {
+			mountCmd.Args = append(mountCmd.Args, "-o", m.options)
+		}
+
+		mountCmd.Stdout = j.logWriter
+		mountCmd.Stderr = j.logWriter
+
+		if err := mountCmd.Run(); err != nil {
+			return fmt.Errorf("failed to mount %s to %s: %w", m.source, targetDir, err)
+		}
+
+		j.mounts = append(j.mounts, targetDir)
+	}
+
+	// Дополнительные точки монтирования из конфигурации
+	for _, mountPoint := range j.config.MountPoints {
+		targetDir := filepath.Join(j.config.ChrootDir, mountPoint.Destination)
+
+		// Создаем директорию, если это не файл
+		if !strings.Contains(targetDir, ".") {
+			if err := os.MkdirAll(targetDir, 0755); err != nil {
+				return fmt.Errorf("failed to create mount target directory %s: %w", targetDir, err)
+			}
+		} else {
+			// Если это путь к файлу, создаем родительскую директорию
+			parentDir := filepath.Dir(targetDir)
+			if err := os.MkdirAll(parentDir, 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory for mount target %s: %w", parentDir, err)
+			}
+
+			// Создаем пустой файл, если он не существует
+			if _, err := os.Stat(targetDir); os.IsNotExist(err) {
+				if file, err := os.Create(targetDir); err != nil {
+					return fmt.Errorf("failed to create mount target file %s: %w", targetDir, err)
+				} else {
+					file.Close()
+				}
+			}
+		}
+
+		var mountCmd *exec.Cmd
+
+		// Обрабатываем bind-монтирование отдельно
+		if mountPoint.Type == "bind" {
+			mountCmd = exec.Command("mount", "--bind", mountPoint.Source, targetDir)
+		} else {
+			// Для других типов файловых систем
+			mountArgs := []string{"-t", mountPoint.Type, mountPoint.Source, targetDir}
+			if len(mountPoint.Options) > 0 {
+				mountArgs = append(mountArgs, "-o", strings.Join(mountPoint.Options, ","))
+			}
+			mountCmd = exec.Command("mount", mountArgs...)
+		}
+
+		mountCmd.Stdout = j.logWriter
+		mountCmd.Stderr = j.logWriter
+
+		if err := mountCmd.Run(); err != nil {
+			return fmt.Errorf("failed to mount %s to %s: %w", mountPoint.Source, targetDir, err)
+		}
+
+		j.mounts = append(j.mounts, targetDir)
+	}
+
+	return nil
 }
 
-func (m *Manager) Stop() error { // Заглушка
+// Start запускает изолированную среду
+func (j *Jail) Start() error {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if j.running {
+		return fmt.Errorf("jail is already running")
+	}
+
+	// Настраиваем точки монтирования
+	if err := j.setupMounts(); err != nil {
+		return err
+	}
+
+	// Создаем команду для chroot
+	j.cmd = exec.Command("/bin/ash")
+
+	// Настраиваем окружение
+	j.cmd.Env = j.config.Environment
+
+	// Настраиваем I/O
+	j.cmd.Stdout = j.logWriter
+	j.cmd.Stderr = j.logWriter
+
+	// Настраиваем namespaces
+	j.cmd.SysProcAttr = &syscall.SysProcAttr{
+		Chroot: j.config.ChrootDir,
+	}
+
+	// Добавляем PID namespace
+	if j.pidNamespace {
+		j.cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWPID
+	}
+
+	// Добавляем User namespace и настраиваем маппинги
+	if len(j.uidMappings) > 0 || len(j.gidMappings) > 0 {
+		j.cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
+
+		// Настраиваем UID/GID маппинг
+		j.cmd.SysProcAttr.UidMappings = make([]syscall.SysProcIDMap, len(j.uidMappings))
+		for i, mapping := range j.uidMappings {
+			j.cmd.SysProcAttr.UidMappings[i] = syscall.SysProcIDMap{
+				ContainerID: mapping.ContainerID,
+				HostID:      mapping.HostID,
+				Size:        mapping.Size,
+			}
+		}
+
+		j.cmd.SysProcAttr.GidMappings = make([]syscall.SysProcIDMap, len(j.gidMappings))
+		for i, mapping := range j.gidMappings {
+			j.cmd.SysProcAttr.GidMappings[i] = syscall.SysProcIDMap{
+				ContainerID: mapping.ContainerID,
+				HostID:      mapping.HostID,
+				Size:        mapping.Size,
+			}
+		}
+	}
+
+	// Запускаем команду
+	if err := j.cmd.Start(); err != nil {
+		// Если не удалось запустить, очищаем монтирование
+		j.cleanup()
+		return fmt.Errorf("failed to start command: %w", err)
+	}
+
+	j.running = true
+	return nil
+}
+
+// cleanup размонтирует все файловые системы
+func (j *Jail) cleanup() {
+	// Размонтируем в обратном порядке
+	for i := len(j.mounts) - 1; i >= 0; i-- {
+		umountCmd := exec.Command("umount", j.mounts[i])
+		umountCmd.Stdout = j.logWriter
+		umountCmd.Stderr = j.logWriter
+
+		if err := umountCmd.Run(); err != nil {
+			fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s: %v\n", j.mounts[i], err)
+		}
+	}
+	j.mounts = []string{}
+}
+
+// Stop останавливает изолированную среду
+func (j *Jail) Stop() error {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if !j.running {
+		return fmt.Errorf("jail is not running")
+	}
+
+	// Останавливаем процесс
+	if j.cmd != nil && j.cmd.Process != nil {
+		if err := j.cmd.Process.Kill(); err != nil {
+			return fmt.Errorf("failed to kill process: %w", err)
+		}
+
+		// Ждем завершения
+		if err := j.cmd.Wait(); err != nil {
+			// Игнорируем ошибку, так как процесс уже убит
+			fmt.Fprintf(j.logWriter, "Error waiting for process to exit: %v\n", err)
+		}
+	}
+
+	// Очищаем монтирование
+	j.cleanup()
+
+	j.running = false
+	return nil
 }
 
 // IsRunning проверяет, выполнена ли изоляция
-func (m *Manager) IsRunning() bool {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+func (j *Jail) IsRunning() bool {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
 
-	return m.running
+	return j.running
 }
 
 // SetLogWriter устанавливает writer для вывода логов
-func (m *Manager) SetLogWriter(writer io.Writer) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+func (j *Jail) SetLogWriter(writer io.Writer) {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
 
-	m.logWriter = writer
+	j.logWriter = writer
+}
+
+// ExecuteCommand выполняет команду в изолированной среде
+func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if !j.running {
+		return nil, fmt.Errorf("jail is not running")
+	}
+
+	// Выводим информацию о выполняемой команде
+	fmt.Fprintf(j.logWriter, "Chroot command: %s %s\n", command, strings.Join(args, " "))
+
+	// Запускаем команду в chroot
+	cmdArgs := append([]string{j.config.ChrootDir, command}, args...)
+	cmd := exec.Command("chroot", cmdArgs...)
+
+	// Выполняем команду и возвращаем результат
+	return cmd.CombinedOutput()
+}
+
+// GetChrootDir возвращает путь к директории chroot
+func (j *Jail) GetChrootDir() string {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+	return j.config.ChrootDir
+}
+
+// IsPidNamespaceEnabled возвращает статус PID namespace
+func (j *Jail) IsPidNamespaceEnabled() bool {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+	return j.pidNamespace
+}
+
+// GetUIDMappings возвращает маппинги UID
+func (j *Jail) GetUIDMappings() []structures.IDMapping {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+	return j.uidMappings
+}
+
+// GetGIDMappings возвращает маппинги GID
+func (j *Jail) GetGIDMappings() []structures.IDMapping {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+	return j.gidMappings
+}
+
+// SetPidNamespace включает или отключает PID namespace
+func (j *Jail) SetPidNamespace(enabled bool) {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if !j.running {
+		j.pidNamespace = enabled
+	}
+}
+
+// SetUIDMappings устанавливает маппинги UID
+func (j *Jail) SetUIDMappings(mappings []structures.IDMapping) {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if !j.running {
+		j.uidMappings = mappings
+	}
+}
+
+// SetGIDMappings устанавливает маппинги GID
+func (j *Jail) SetGIDMappings(mappings []structures.IDMapping) {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if !j.running {
+		j.gidMappings = mappings
+	}
 }
