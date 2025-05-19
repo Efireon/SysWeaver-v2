@@ -221,12 +221,13 @@ func (j *Jail) setupMounts() error {
 // mountTemplate монтирует компоненты шаблона в соответствующие точки
 func (j *Jail) mountTemplate() error {
 	templateMounts := []struct {
-		source string
-		target string
-		name   string
+		source   string
+		target   string
+		name     string
+		writable bool // Нужна ли запись в эту директорию
 	}{
-		{j.config.TemplatePath, "/template", "template root"},
-		{filepath.Join(j.config.TemplatePath, "scripts"), "/scripts", "template scripts"},
+		{j.config.TemplatePath, "/template", "template root", false},
+		{filepath.Join(j.config.TemplatePath, "scripts"), "/scripts", "template scripts", false},
 	}
 
 	for _, tmpl := range templateMounts {
@@ -243,8 +244,16 @@ func (j *Jail) mountTemplate() error {
 			return fmt.Errorf("failed to create template mount directory %s: %w", targetDir, err)
 		}
 
-		// Монтируем как bind mount
-		mountCmd := exec.Command("mount", "--bind", tmpl.source, targetDir)
+		// Монтируем как bind mount с правильными опциями
+		var mountCmd *exec.Cmd
+		if tmpl.writable {
+			// Для записываемых директорий - обычный bind mount
+			mountCmd = exec.Command("mount", "--bind", tmpl.source, targetDir)
+		} else {
+			// Для читаемых директорий - read-only bind mount
+			mountCmd = exec.Command("mount", "--bind", tmpl.source, targetDir)
+		}
+
 		mountCmd.Stdout = j.logWriter
 		mountCmd.Stderr = j.logWriter
 
@@ -253,8 +262,106 @@ func (j *Jail) mountTemplate() error {
 			continue
 		}
 
+		// Для read-only директорий добавляем remount с ro опцией
+		if !tmpl.writable {
+			remountCmd := exec.Command("mount", "-o", "remount,ro,bind", targetDir)
+			remountCmd.Stdout = j.logWriter
+			remountCmd.Stderr = j.logWriter
+
+			if err := remountCmd.Run(); err != nil {
+				fmt.Fprintf(j.logWriter, "Warning: failed to remount %s as read-only: %v\n", tmpl.name, err)
+			}
+		}
+
 		fmt.Fprintf(j.logWriter, "Successfully mounted %s to %s\n", tmpl.name, targetDir)
 		j.mounts = append(j.mounts, targetDir)
+	}
+
+	// Дополнительно: копируем содержимое шаблона в upperdir для записи
+	// Это позволит скриптам изменять скопированные файлы без проблем с правами
+	return j.copyTemplateToUpper()
+}
+
+// copyTemplateToUpper копирует содержимое шаблона в upper слой overlay
+func (j *Jail) copyTemplateToUpper() error {
+	// Находим upper директорию в текущих mount'ах
+	upperDir := ""
+
+	// Читаем /proc/mounts чтобы найти overlay с нашим chroot
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return fmt.Errorf("failed to read /proc/mounts: %w", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[1] == j.config.ChrootDir && fields[2] == "overlay" {
+			// Парсим опции overlay
+			options := strings.Split(fields[3], ",")
+			for _, opt := range options {
+				if strings.HasPrefix(opt, "upperdir=") {
+					upperDir = strings.TrimPrefix(opt, "upperdir=")
+					break
+				}
+			}
+			break
+		}
+	}
+
+	if upperDir == "" {
+		return fmt.Errorf("could not find upperdir for overlay")
+	}
+
+	// Копируем содержимое template/root в upperdir, изменяя владельца на текущего пользователя
+	templateRoot := filepath.Join(j.config.TemplatePath, "root")
+	if _, err := os.Stat(templateRoot); err == nil {
+		fmt.Fprintf(j.logWriter, "Copying template root to upper layer...\n")
+
+		// Используем rsync для копирования с правильными правами
+		rsyncCmd := exec.Command("rsync", "-av", "--chown="+fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), templateRoot+"/", upperDir+"/")
+		rsyncCmd.Stdout = j.logWriter
+		rsyncCmd.Stderr = j.logWriter
+
+		if err := rsyncCmd.Run(); err != nil {
+			// Если rsync не удался, пробуем обычное копирование
+			fmt.Fprintf(j.logWriter, "Rsync failed, trying cp...\n")
+			cpCmd := exec.Command("cp", "-a", templateRoot+"/.", upperDir+"/")
+			cpCmd.Stdout = j.logWriter
+			cpCmd.Stderr = j.logWriter
+
+			if err := cpCmd.Run(); err != nil {
+				return fmt.Errorf("failed to copy template root: %w", err)
+			}
+		}
+	}
+
+	// Копируем содержимое template/boot, если оно есть
+	templateBoot := filepath.Join(j.config.TemplatePath, "boot")
+	if _, err := os.Stat(templateBoot); err == nil {
+		fmt.Fprintf(j.logWriter, "Copying template boot to upper layer...\n")
+
+		upperBoot := filepath.Join(upperDir, "boot")
+		if err := os.MkdirAll(upperBoot, 0755); err != nil {
+			return fmt.Errorf("failed to create boot directory in upper: %w", err)
+		}
+
+		// Используем rsync для boot файлов
+		rsyncCmd := exec.Command("rsync", "-av", "--chown="+fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), templateBoot+"/", upperBoot+"/")
+		rsyncCmd.Stdout = j.logWriter
+		rsyncCmd.Stderr = j.logWriter
+
+		if err := rsyncCmd.Run(); err != nil {
+			// Если rsync не удался, пробуем обычное копирование
+			fmt.Fprintf(j.logWriter, "Rsync failed for boot, trying cp...\n")
+			cpCmd := exec.Command("cp", "-a", templateBoot+"/.", upperBoot+"/")
+			cpCmd.Stdout = j.logWriter
+			cpCmd.Stderr = j.logWriter
+
+			if err := cpCmd.Run(); err != nil {
+				fmt.Fprintf(j.logWriter, "Warning: failed to copy template boot: %v\n", err)
+			}
+		}
 	}
 
 	return nil
@@ -343,15 +450,26 @@ func (j *Jail) isMounted(path string) bool {
 	// Читаем /proc/mounts для проверки
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
+		fmt.Fprintf(j.logWriter, "Warning: cannot read /proc/mounts: %v\n", err)
 		return false
+	}
+
+	// Нормализуем путь
+	normalizedPath, err := filepath.Abs(path)
+	if err != nil {
+		normalizedPath = path
 	}
 
 	// Проверяем, есть ли наш путь в списке монтирований
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == path {
-			return true
+		if len(fields) >= 2 {
+			mountPoint := fields[1]
+			// Сравниваем как точное совпадение, так и нормализованный путь
+			if mountPoint == path || mountPoint == normalizedPath {
+				return true
+			}
 		}
 	}
 
@@ -360,9 +478,13 @@ func (j *Jail) isMounted(path string) bool {
 
 // cleanup размонтирует все файловые системы
 func (j *Jail) cleanup() {
+	fmt.Fprintf(j.logWriter, "Starting cleanup process...\n")
+
 	// Размонтируем в обратном порядке
 	for i := len(j.mounts) - 1; i >= 0; i-- {
 		mountPoint := j.mounts[i]
+
+		fmt.Fprintf(j.logWriter, "Processing mount point: %s\n", mountPoint)
 
 		// Проверяем, смонтирован ли путь
 		if !j.isMounted(mountPoint) {
@@ -370,21 +492,113 @@ func (j *Jail) cleanup() {
 			continue
 		}
 
+		fmt.Fprintf(j.logWriter, "Unmounting %s...\n", mountPoint)
+
+		// Сначала пытаемся обычное размонтирование
 		umountCmd := exec.Command("umount", mountPoint)
 		umountCmd.Stdout = j.logWriter
 		umountCmd.Stderr = j.logWriter
 
 		if err := umountCmd.Run(); err != nil {
-			fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s: %v\n", mountPoint, err)
+			fmt.Fprintf(j.logWriter, "Warning: normal unmount failed for %s: %v\n", mountPoint, err)
 
-			// Пытаемся принудительно размонтировать
+			// Принудительное размонтирование
+			fmt.Fprintf(j.logWriter, "Trying forced unmount for %s...\n", mountPoint)
 			forceCmd := exec.Command("umount", "-f", mountPoint)
 			forceCmd.Stdout = j.logWriter
 			forceCmd.Stderr = j.logWriter
-			forceCmd.Run()
+
+			if err := forceCmd.Run(); err != nil {
+				fmt.Fprintf(j.logWriter, "Warning: forced unmount failed for %s: %v\n", mountPoint, err)
+
+				// Ленивое размонтирование как последний шанс
+				fmt.Fprintf(j.logWriter, "Trying lazy unmount for %s...\n", mountPoint)
+				lazyCmd := exec.Command("umount", "-l", mountPoint)
+				lazyCmd.Stdout = j.logWriter
+				lazyCmd.Stderr = j.logWriter
+				lazyCmd.Run() // Игнорируем ошибку для lazy unmount
+			}
+		} else {
+			fmt.Fprintf(j.logWriter, "Successfully unmounted %s\n", mountPoint)
 		}
 	}
+
+	// Очищаем список mount'ов
 	j.mounts = []string{}
+
+	// Дополнительная очистка: принудительно размонтируем все что может остаться
+	if j.config.ChrootDir != "" {
+		fmt.Fprintf(j.logWriter, "Performing additional cleanup for %s...\n", j.config.ChrootDir)
+
+		// Список возможных mount точек для принудительной очистки
+		possibleMounts := []string{
+			filepath.Join(j.config.ChrootDir, "dev/pts"),
+			filepath.Join(j.config.ChrootDir, "dev"),
+			filepath.Join(j.config.ChrootDir, "proc"),
+			filepath.Join(j.config.ChrootDir, "sys"),
+			filepath.Join(j.config.ChrootDir, "template"),
+			filepath.Join(j.config.ChrootDir, "scripts"),
+			j.config.ChrootDir, // overlay сам по себе
+		}
+
+		for _, mount := range possibleMounts {
+			if j.isMounted(mount) {
+				fmt.Fprintf(j.logWriter, "Found remaining mount: %s, force unmounting...\n", mount)
+				exec.Command("umount", "-f", mount).Run()
+				exec.Command("umount", "-l", mount).Run()
+			}
+		}
+	}
+
+	// Очищаем loop устройства созданные скриптами (мера безопасности)
+	fmt.Fprintf(j.logWriter, "Cleaning up loop devices...\n")
+	j.cleanupLoopDevices()
+
+	// Очищаем временные директории
+	if strings.Contains(j.config.ChrootDir, "sysweaver") {
+		tmpBase := filepath.Dir(j.config.ChrootDir)
+		if strings.Contains(tmpBase, "tmp") {
+			fmt.Fprintf(j.logWriter, "Removing temporary directory: %s\n", tmpBase)
+			os.RemoveAll(tmpBase)
+		}
+	}
+
+	fmt.Fprintf(j.logWriter, "Cleanup completed\n")
+}
+
+// cleanupLoopDevices очищает все loop устройства связанные с образами
+func (j *Jail) cleanupLoopDevices() {
+	// Получаем список всех loop устройств
+	cmd := exec.Command("losetup", "-a")
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Fprintf(j.logWriter, "Warning: could not list loop devices: %v\n", err)
+		return
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+
+		// Ищем строки содержащие наши образы
+		if strings.Contains(line, "alpine-custom.img") ||
+			strings.Contains(line, "sysweaver") {
+			// Извлекаем имя loop устройства
+			fields := strings.Split(line, ":")
+			if len(fields) > 0 {
+				loopDev := strings.TrimSpace(fields[0])
+				fmt.Fprintf(j.logWriter, "Detaching loop device: %s\n", loopDev)
+
+				// Отключаем loop устройство
+				detachCmd := exec.Command("losetup", "-d", loopDev)
+				detachCmd.Stdout = j.logWriter
+				detachCmd.Stderr = j.logWriter
+				detachCmd.Run() // Игнорируем ошибки
+			}
+		}
+	}
 }
 
 // Stop останавливает изолированную среду
@@ -432,7 +646,7 @@ func (j *Jail) SetLogWriter(writer io.Writer) {
 	j.logWriter = writer
 }
 
-// ExecuteCommand выполняет команду в изолированной среде с live выводом
+// ExecuteCommand выполняет команду в изолированной среде с live выводом (для verbose режима)
 func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	j.mutex.Lock()
 	defer j.mutex.Unlock()
@@ -448,7 +662,7 @@ func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	cmdArgs := append([]string{j.config.ChrootDir, command}, args...)
 	cmd := exec.Command("chroot", cmdArgs...)
 
-	// Настраиваем live вывод
+	// Настраиваем live вывод через logWriter
 	cmd.Stdout = j.logWriter
 	cmd.Stderr = j.logWriter
 
@@ -458,6 +672,31 @@ func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	}
 
 	return nil, nil
+}
+
+// ExecuteCommandWithOutput выполняет команду и возвращает вывод (для обычного режима)
+func (j *Jail) ExecuteCommandWithOutput(command string, args ...string) ([]byte, error) {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+
+	if !j.running {
+		return nil, fmt.Errorf("jail is not running")
+	}
+
+	// Выводим информацию о выполняемой команде
+	fmt.Fprintf(j.logWriter, "Chroot command: %s %s\n", command, strings.Join(args, " "))
+
+	// Запускаем команду в chroot
+	cmdArgs := append([]string{j.config.ChrootDir, command}, args...)
+	cmd := exec.Command("chroot", cmdArgs...)
+
+	// Выполняем команду и собираем вывод
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("command failed: %w", err)
+	}
+
+	return output, nil
 }
 
 // GetChrootDir возвращает путь к директории chroot

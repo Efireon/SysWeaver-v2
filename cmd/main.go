@@ -117,7 +117,7 @@ The template should contain all necessary scripts and configurations.`,
 
 		// Выполняем скрипты
 		for i, script := range scripts {
-			// Получаем только имя скрипта, без пути
+			// Получаем только имя скрипта (без пути)
 			scriptName := filepath.Base(script)
 
 			// Добавляем информацию о прогрессе
@@ -129,20 +129,92 @@ The template should contain all necessary scripts and configurations.`,
 			startTime := time.Now()
 
 			// Путь к скрипту внутри chroot
-			chrootScriptPath := filepath.Join("/scripts/install", scriptName)
+			chrootScriptPath := "/scripts/install/" + scriptName
 
-			// Запускаем скрипт внутри chroot
-			output, err := j.ExecuteCommand("/bin/sh", chrootScriptPath)
+			// В зависимости от режима выполняем скрипт
+			var err error
+			if verbose {
+				// В verbose режиме - live вывод
+				fmt.Println("--- Live output ---")
+				_, err = j.ExecuteCommand("/bin/sh", chrootScriptPath)
+			} else {
+				// В обычном режиме - собираем вывод и показываем после
+				output, execErr := j.ExecuteCommandWithOutput("/bin/sh", chrootScriptPath)
+				err = execErr
 
-			// Вычисляем время выполнения
+				// Вычисляем время выполнения
+				duration := time.Since(startTime)
+
+				// Выводим результаты выполнения
+				if err != nil {
+					fmt.Printf("❌ Script failed (%.2f seconds): %v\n", duration.Seconds(), err)
+					fmt.Println("--- Output begin ---")
+					fmt.Println(string(output))
+					fmt.Println("--- Output end ---")
+
+					// Если мы в ручном режиме, позволяем пользователю исследовать состояние
+					if manual {
+						fmt.Println("\nEntering manual mode for debugging. Type 'exit' to quit.")
+
+						// Запускаем интерактивную оболочку
+						shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
+						shellCmd.Stdin = os.Stdin
+						shellCmd.Stdout = os.Stdout
+						shellCmd.Stderr = os.Stderr
+
+						if shellErr := shellCmd.Run(); shellErr != nil {
+							fmt.Printf("Error in interactive shell: %v\n", shellErr)
+						}
+
+						fmt.Println("Exited from manual mode, continuing with cleanup...")
+					}
+
+					// Возвращаем ошибку - cleanup будет выполнен через defer
+					return fmt.Errorf("error executing script %s: %v", scriptName, err)
+				}
+
+				// Если скрипт выполнился успешно, выводим время
+				fmt.Printf("✅ Script completed successfully in %.2f seconds\n", duration.Seconds())
+
+				// Показываем краткий вывод или полный в зависимости от размера
+				if len(output) < 500 {
+					if len(output) > 0 {
+						fmt.Println("--- Output begin ---")
+						fmt.Println(string(output))
+						fmt.Println("--- Output end ---")
+					}
+				} else {
+					// Если вывод длинный, показываем только начало и конец
+					lines := strings.Split(string(output), "\n")
+					if len(lines) > 10 {
+						fmt.Println("--- Output preview (use --verbose for full output) ---")
+						for i := 0; i < 5; i++ {
+							if i < len(lines) {
+								fmt.Println(lines[i])
+							}
+						}
+						fmt.Println("...")
+						for i := len(lines) - 5; i < len(lines); i++ {
+							if i >= 0 && i < len(lines) {
+								fmt.Println(lines[i])
+							}
+						}
+						fmt.Println("--- End of preview ---")
+					} else {
+						fmt.Println("--- Output begin ---")
+						fmt.Println(string(output))
+						fmt.Println("--- Output end ---")
+					}
+				}
+				continue // Переходим к следующему скрипту, так как время уже подсчитано
+			}
+
+			// Вычисляем время выполнения (только для verbose режима)
 			duration := time.Since(startTime)
 
 			// Выводим результаты выполнения
 			if err != nil {
 				fmt.Printf("❌ Script failed (%.2f seconds): %v\n", duration.Seconds(), err)
-				fmt.Println("--- Output begin ---")
-				fmt.Println(string(output))
-				fmt.Println("--- Output end ---")
 
 				// Если мы в ручном режиме, позволяем пользователю исследовать состояние
 				if manual {
@@ -161,41 +233,68 @@ The template should contain all necessary scripts and configurations.`,
 					fmt.Println("Exited from manual mode, continuing with cleanup...")
 				}
 
-				// Возвращаем ошибку - cleanup будет выполнен через defer
 				return fmt.Errorf("error executing script %s: %v", scriptName, err)
 			}
 
 			// Если скрипт выполнился успешно, выводим время
 			fmt.Printf("✅ Script completed successfully in %.2f seconds\n", duration.Seconds())
+		}
 
-			// В verbose режиме или если вывод короткий, показываем его в любом случае
-			if verbose || len(output) < 500 {
-				fmt.Println("--- Output begin ---")
-				fmt.Println(string(output))
-				fmt.Println("--- Output end ---")
-			} else {
-				// Если вывод длинный и не verbose, показываем только начало и конец
-				lines := strings.Split(string(output), "\n")
-				if len(lines) > 10 {
-					fmt.Println("--- Output preview (use --verbose for full output) ---")
-					for i := 0; i < 5; i++ {
-						if i < len(lines) {
-							fmt.Println(lines[i])
-						}
-					}
-					fmt.Println("...")
-					for i := len(lines) - 5; i < len(lines); i++ {
-						if i >= 0 && i < len(lines) {
-							fmt.Println(lines[i])
-						}
-					}
-					fmt.Println("--- End of preview ---")
-				} else {
-					fmt.Println("--- Output begin ---")
-					fmt.Println(string(output))
-					fmt.Println("--- Output end ---")
-				}
+		fmt.Println("\n✅ All installation scripts completed successfully!")
+
+		if manual {
+			// Если включен ручной режим, даем пользователю возможность войти в jail
+			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
+
+			// Запускаем интерактивную оболочку
+			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
+			shellCmd.Stdin = os.Stdin
+			shellCmd.Stdout = os.Stdout
+			shellCmd.Stderr = os.Stderr
+
+			if err := shellCmd.Run(); err != nil {
+				fmt.Printf("Error in interactive shell: %v\n", err)
 			}
+
+			fmt.Println("Exited from manual mode, continuing with image copying...")
+		}
+
+		fmt.Println("\n✅ All installation scripts completed successfully!")
+
+		if manual {
+			// Если включен ручной режим, даем пользователю возможность войти в jail
+			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
+
+			// Запускаем интерактивную оболочку
+			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
+			shellCmd.Stdin = os.Stdin
+			shellCmd.Stdout = os.Stdout
+			shellCmd.Stderr = os.Stderr
+
+			if err := shellCmd.Run(); err != nil {
+				fmt.Printf("Error in interactive shell: %v\n", err)
+			}
+
+			fmt.Println("Exited from manual mode, continuing with image copying...")
+		}
+
+		fmt.Println("\n✅ All installation scripts completed successfully!")
+
+		if manual {
+			// Если включен ручной режим, даем пользователю возможность войти в jail
+			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
+
+			// Запускаем интерактивную оболочку
+			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
+			shellCmd.Stdin = os.Stdin
+			shellCmd.Stdout = os.Stdout
+			shellCmd.Stderr = os.Stderr
+
+			if err := shellCmd.Run(); err != nil {
+				fmt.Printf("Error in interactive shell: %v\n", err)
+			}
+
+			fmt.Println("Exited from manual mode, continuing with image copying...")
 		}
 
 		fmt.Println("\n✅ All installation scripts completed successfully!")
