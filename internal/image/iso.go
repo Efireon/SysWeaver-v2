@@ -85,97 +85,24 @@ func CreateISO(config ISOConfig) error {
 			"-c", "boot/isolinux/boot.cat",
 		)
 	} else {
-		fmt.Println("Warning: isolinux.bin not found, ISO will not be bootable")
+		fmt.Println("Warning: isolinux.bin not found, ISO will not be bootable via BIOS")
 	}
 
-	// Проверка загрузочных файлов
-	fmt.Println("\nChecking boot files:")
-
-	// Проверяем структуру ISOLINUX
-	isolinuxBin := filepath.Join(config.SourcePath, "boot/isolinux/isolinux.bin")
-	filepath.Join(config.SourcePath, "boot/isolinux/boot.cat")
-	isolinuxCfg := filepath.Join(config.SourcePath, "boot/isolinux/isolinux.cfg")
-
-	if _, err := os.Stat(isolinuxBin); os.IsNotExist(err) {
-		fmt.Println("ERROR: isolinux.bin not found at", isolinuxBin)
-		fmt.Println("To create a bootable ISO, add the following to your build scripts:")
-		fmt.Println("  mkdir -p /boot/isolinux")
-		fmt.Println("  cp /usr/share/syslinux/isolinux.bin /boot/isolinux/")
-		fmt.Println("  cp /usr/share/syslinux/ldlinux.c32 /boot/isolinux/")
-		fmt.Println("  # Also create a proper isolinux.cfg")
-	} else {
-		fmt.Println("✅ Found isolinux.bin")
-
-		// Проверяем isolinux.cfg
-		if _, err := os.Stat(isolinuxCfg); os.IsNotExist(err) {
-			fmt.Println("WARNING: isolinux.cfg not found, boot menu will not be available")
-		} else {
-			fmt.Println("✅ Found isolinux.cfg")
-		}
-	}
-
-	// Проверяем EFI
+	// Добавляем EFI загрузку, если она есть
 	efiPath := filepath.Join(config.SourcePath, "boot/efi.img")
-	if _, err := os.Stat(efiPath); os.IsNotExist(err) {
-		fmt.Println("ERROR: efi.img not found at", efiPath)
-		fmt.Println("To add EFI boot support, add the following to your build scripts:")
-		fmt.Println("  # Install required packages")
-		fmt.Println("  apk add grub-efi mtools xorriso")
-		fmt.Println("  # Create EFI image")
-		fmt.Println("  mkdir -p /boot/efi /boot/grub")
-		fmt.Println("  grub-mkimage -o /boot/efi/bootx64.efi -p /boot/grub -O x86_64-efi normal part_gpt fat")
-		fmt.Println("  # Create the efi.img file")
-		fmt.Println("  dd if=/dev/zero of=/boot/efi.img bs=1M count=4")
-		fmt.Println("  mkfs.vfat /boot/efi.img")
-		fmt.Println("  # Mount and populate")
-		fmt.Println("  mkdir -p /mnt/efi")
-		fmt.Println("  mount -o loop /boot/efi.img /mnt/efi")
-		fmt.Println("  mkdir -p /mnt/efi/EFI/BOOT")
-		fmt.Println("  cp /boot/efi/bootx64.efi /mnt/efi/EFI/BOOT/")
-		fmt.Println("  umount /mnt/efi")
-	} else {
-		fmt.Println("✅ Found efi.img")
-	}
 	if _, err := os.Stat(efiPath); err == nil {
-		// Проверяем размер EFI образа
-		efiInfo, err := os.Stat(efiPath)
-		if err == nil {
-			efiSize := efiInfo.Size() / 1024 // размер в KB
-			fmt.Printf("Found EFI image (size: %d KB)\n", efiSize)
+		efiSize := "Skipping EFI boot for now - will be enabled in future versions"
+		fmt.Println(efiSize)
 
-			// Если размер не соответствует требованиям El-Torito
-			if efiSize != 1200 && efiSize != 1440 && efiSize != 2880 {
-				fmt.Println("WARNING: EFI image size does not match required El-Torito sizes (1.2MB, 1.44MB, 2.88MB)")
-				fmt.Println("Attempting to resize EFI image to 1.44MB...")
-
-				// Создаем временный образ правильного размера
-				tempEfiPath := filepath.Join(os.TempDir(), "efi.img")
-
-				// Создаем пустой образ размером 1.44MB
-				ddCmd := exec.Command("dd", "if=/dev/zero", "of="+tempEfiPath, "bs=1k", "count=1440")
-				if err := ddCmd.Run(); err != nil {
-					fmt.Printf("Warning: could not create temporary EFI image: %v\n", err)
-				} else {
-					// Копируем содержимое оригинального образа в новый
-					ddCmd = exec.Command("dd", "if="+efiPath, "of="+tempEfiPath, "conv=notrunc")
-					if err := ddCmd.Run(); err != nil {
-						fmt.Printf("Warning: could not copy EFI content: %v\n", err)
-					} else {
-						// Используем новый образ вместо оригинального
-						efiPath = tempEfiPath
-						fmt.Println("Successfully resized EFI image to 1.44MB")
-					}
-				}
-			}
-
-			fmt.Println("Adding EFI boot options")
+		// НЕ добавляем опции EFI для MVP
+		/*
 			args = append(args,
 				"-eltorito-alt-boot",
 				"-e", "boot/efi.img",
 				"-no-emul-boot",
 				"-isohybrid-gpt-basdat",
 			)
-		}
+		*/
 	} else {
 		fmt.Println("Warning: efi.img not found, ISO will not support EFI boot")
 	}

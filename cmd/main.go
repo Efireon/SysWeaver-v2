@@ -2,11 +2,12 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sysweaver/internal/config"
-	"sysweaver/internal/image"
 	"sysweaver/internal/jail"
 	"sysweaver/internal/structures"
 	"time"
@@ -20,6 +21,7 @@ var (
 	outputPath   string
 	configPath   string
 	verbose      bool
+	manual       bool // Новый флаг для ручного режима
 )
 
 // rootCmd представляет базовую команду
@@ -72,17 +74,29 @@ The template should contain all necessary scripts and configurations.`,
 			return fmt.Errorf("error creating jail: %w", err)
 		}
 
-		// Гарантируем очистку ресурсов при выходе
-		defer func() {
-			if j.IsRunning() {
+		// ВАЖНО: Гарантируем очистку ресурсов при выходе, независимо от результата
+		cleanup := func() {
+			if j != nil && j.IsRunning() {
 				fmt.Println("Cleaning up resources...")
-				j.Stop()
+				if stopErr := j.Stop(); stopErr != nil {
+					fmt.Printf("Warning: error during cleanup: %v\n", stopErr)
+				}
 			}
-		}()
+		}
+
+		// Используем defer для гарантированного выполнения cleanup
+		// Не пропускаем cleanup даже в ручном режиме, чтобы предотвратить утечку ресурсов
+		defer cleanup()
 
 		// Включаем verbose режим, если указан
 		if verbose {
 			j.SetLogWriter(os.Stdout)
+		}
+
+		// Создаем директорию output внутри chroot
+		outputDirInChroot := filepath.Join(j.GetChrootDir(), "output")
+		if err := os.MkdirAll(outputDirInChroot, 0755); err != nil {
+			return fmt.Errorf("error creating output directory in chroot: %w", err)
 		}
 
 		// Запускаем изолированную среду
@@ -103,7 +117,7 @@ The template should contain all necessary scripts and configurations.`,
 
 		// Выполняем скрипты
 		for i, script := range scripts {
-			// Получаем только имя скрипта (без пути)
+			// Получаем только имя скрипта, без пути
 			scriptName := filepath.Base(script)
 
 			// Добавляем информацию о прогрессе
@@ -115,9 +129,9 @@ The template should contain all necessary scripts and configurations.`,
 			startTime := time.Now()
 
 			// Путь к скрипту внутри chroot
-			chrootScriptPath := "/scripts/install/" + scriptName
+			chrootScriptPath := filepath.Join("/scripts/install", scriptName)
 
-			// Запускаем скрипт внутри chroot с правильным путем
+			// Запускаем скрипт внутри chroot
 			output, err := j.ExecuteCommand("/bin/sh", chrootScriptPath)
 
 			// Вычисляем время выполнения
@@ -129,6 +143,25 @@ The template should contain all necessary scripts and configurations.`,
 				fmt.Println("--- Output begin ---")
 				fmt.Println(string(output))
 				fmt.Println("--- Output end ---")
+
+				// Если мы в ручном режиме, позволяем пользователю исследовать состояние
+				if manual {
+					fmt.Println("\nEntering manual mode for debugging. Type 'exit' to quit.")
+
+					// Запускаем интерактивную оболочку
+					shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
+					shellCmd.Stdin = os.Stdin
+					shellCmd.Stdout = os.Stdout
+					shellCmd.Stderr = os.Stderr
+
+					if shellErr := shellCmd.Run(); shellErr != nil {
+						fmt.Printf("Error in interactive shell: %v\n", shellErr)
+					}
+
+					fmt.Println("Exited from manual mode, continuing with cleanup...")
+				}
+
+				// Возвращаем ошибку - cleanup будет выполнен через defer
 				return fmt.Errorf("error executing script %s: %v", scriptName, err)
 			}
 
@@ -167,82 +200,67 @@ The template should contain all necessary scripts and configurations.`,
 
 		fmt.Println("\n✅ All installation scripts completed successfully!")
 
-		if len(buildConfig.Partitions) > 0 {
-			fmt.Println("\n=== Creating raw disk image ===")
+		if manual {
+			// Если включен ручной режим, даем пользователю возможность войти в jail
+			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
 
-			// Преобразуем конфигурацию разделов из buildConfig
-			partitions := make([]image.PartitionConfig, len(buildConfig.Partitions))
+			// Запускаем интерактивную оболочку
+			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
+			shellCmd.Stdin = os.Stdin
+			shellCmd.Stdout = os.Stdout
+			shellCmd.Stderr = os.Stderr
 
-			// Вычисляем общий размер образа на основе размеров разделов
-			totalSize := 0
-			hasUnboundedPartition := false
-
-			for i, p := range buildConfig.Partitions {
-				partitions[i] = image.PartitionConfig{
-					Name:       p.Name,
-					Size:       p.Size,
-					Filesystem: p.Filesystem,
-					Mount:      p.Mount,
-					Flags:      p.Flags,
-				}
-
-				fmt.Printf("Adding partition from config: %s (%s, %s)\n", p.Name, p.Mount, p.Filesystem)
-
-				// Суммируем размеры всех разделов с фиксированным размером
-				if p.Size != "*" {
-					partSize := image.ParseSizeToMB(p.Size)
-					totalSize += partSize
-					fmt.Printf("Partition %s size: %d MB\n", p.Name, partSize)
-				} else {
-					hasUnboundedPartition = true
-					fmt.Printf("Partition %s has dynamic size (*)\n", p.Name)
-				}
+			if err := shellCmd.Run(); err != nil {
+				fmt.Printf("Error in interactive shell: %v\n", err)
 			}
 
-			// Добавляем дополнительное пространство для раздела с "*" и учитываем служебную информацию
-			if hasUnboundedPartition {
-				// Добавляем 1GB для раздела с "*" плюс 10% запаса
-				totalSize += 1024 // 1GB для раздела с "*"
-			}
-
-			// Добавляем 10% запаса и минимум 50MB для служебной информации
-			totalSize = totalSize + int(float64(totalSize)*0.1) + 50
-
-			// Конвертируем обратно в строку с единицей измерения
-			var imgSize string
-			if totalSize >= 1024 {
-				// Если больше 1GB, выражаем в GB
-				imgSize = fmt.Sprintf("%dG", (totalSize+1023)/1024) // Округляем вверх
-			} else {
-				imgSize = fmt.Sprintf("%dM", totalSize)
-			}
-
-			rawConfig := image.RawConfig{
-				OutputPath:  filepath.Join(outputPath, fmt.Sprintf("%s-%s.img", buildConfig.Name, time.Now().Format("20060102-150405"))),
-				Size:        imgSize,
-				Partitions:  partitions,
-				TemplateDir: templatePath,
-			}
-
-			fmt.Printf("Creating image with calculated size: %s based on %d partitions\n",
-				imgSize, len(partitions))
-
-			if err := image.CreateRawImage(rawConfig); err != nil {
-				return fmt.Errorf("error creating raw image: %w", err)
-			}
+			fmt.Println("Exited from manual mode, continuing with image copying...")
 		}
 
-		// Создаем ISO-образ
-		isoConfig := image.ISOConfig{
-			Label:       buildConfig.ISO.Label,
-			Publisher:   buildConfig.ISO.Publisher,
-			SourcePath:  j.GetChrootDir(),
-			OutputPath:  filepath.Join(outputPath, fmt.Sprintf("%s-%s.iso", buildConfig.Name, time.Now().Format("20060102-150405"))),
-			Compression: buildConfig.ISO.Compression,
+		// Копируем готовые образы из chroot в указанную директорию вывода
+		fmt.Println("\nCopying built images from jail...")
+
+		// Создаем директорию для вывода, если она не существует
+		if err := os.MkdirAll(outputPath, 0755); err != nil {
+			return fmt.Errorf("error creating output directory: %w", err)
 		}
 
-		if err := image.CreateISO(isoConfig); err != nil {
-			return fmt.Errorf("error creating ISO: %w", err)
+		// Ищем файлы в /output внутри chroot
+		outputFiles, err := filepath.Glob(filepath.Join(outputDirInChroot, "*"))
+		if err != nil {
+			return fmt.Errorf("error searching for output files: %w", err)
+		}
+
+		if len(outputFiles) == 0 {
+			fmt.Println("Warning: No output files found in /output directory inside jail.")
+		} else {
+			// Копируем каждый файл
+			for _, file := range outputFiles {
+				fileName := filepath.Base(file)
+				destPath := filepath.Join(outputPath, fileName)
+
+				fmt.Printf("Copying %s to %s\n", fileName, destPath)
+
+				// Копируем файл
+				input, err := os.Open(file)
+				if err != nil {
+					return fmt.Errorf("error opening source file: %w", err)
+				}
+				defer input.Close()
+
+				output, err := os.Create(destPath)
+				if err != nil {
+					input.Close() // Закрываем входной файл при ошибке
+					return fmt.Errorf("error creating destination file: %w", err)
+				}
+				defer output.Close()
+
+				if _, err := io.Copy(output, input); err != nil {
+					return fmt.Errorf("error copying file: %w", err)
+				}
+
+				fmt.Printf("Successfully copied %s\n", fileName)
+			}
 		}
 
 		fmt.Println("Build completed successfully!")
@@ -323,6 +341,7 @@ func init() {
 	// Флаги для кома`нды build
 	buildCmd.Flags().StringVarP(&outputPath, "output", "o", "./output", "Output directory for the built image")
 	buildCmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to the configuration file (defaults to template/config.yaml)")
+	buildCmd.Flags().BoolVarP(&manual, "manual", "m", false, "Enter manual mode after scripts execution")
 
 	// Добавляем подкоманды
 	rootCmd.AddCommand(buildCmd)

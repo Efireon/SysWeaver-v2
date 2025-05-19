@@ -1,14 +1,18 @@
 package jail
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"sysweaver/internal/config"
 	"sysweaver/internal/structures"
@@ -308,7 +312,7 @@ func (j *Jail) cleanup() {
 	j.mounts = []string{}
 }
 
-// Stop останавливает изолированную среду
+// Stop останавливает изолированную среду и освобождает все ресурсы
 func (j *Jail) Stop() error {
 	j.mutex.Lock()
 	defer j.mutex.Unlock()
@@ -317,24 +321,141 @@ func (j *Jail) Stop() error {
 		return fmt.Errorf("jail is not running")
 	}
 
+	fmt.Fprintf(j.logWriter, "Cleaning up resources...\n")
+
 	// Останавливаем процесс
 	if j.cmd != nil && j.cmd.Process != nil {
 		if err := j.cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("failed to kill process: %w", err)
+			fmt.Fprintf(j.logWriter, "Warning: failed to kill process: %v\n", err)
 		}
 
 		// Ждем завершения
 		if err := j.cmd.Wait(); err != nil {
-			// Игнорируем ошибку, так как процесс уже убит
-			fmt.Fprintf(j.logWriter, "Error waiting for process to exit: %v\n", err)
+			fmt.Fprintf(j.logWriter, "Warning: error waiting for process to exit: %v\n", err)
 		}
 	}
 
-	// Очищаем монтирование
-	j.cleanup()
+	// Ищем все точки монтирования внутри chroot директории
+	chrootMounts, err := findMountsInPath(j.config.ChrootDir)
+	if err != nil {
+		fmt.Fprintf(j.logWriter, "Warning: error finding mounts in chroot: %v\n", err)
+	}
 
+	// Размонтируем все найденные точки монтирования внутри chroot (в обратном порядке)
+	for i := len(chrootMounts) - 1; i >= 0; i-- {
+		fmt.Fprintf(j.logWriter, "Unmounting %s...\n", chrootMounts[i])
+
+		// Несколько попыток размонтирования с увеличением агрессивности
+		for attempt := 0; attempt < 3; attempt++ {
+			var cmd *exec.Cmd
+
+			if attempt == 0 {
+				// Первая попытка: обычное размонтирование
+				cmd = exec.Command("umount", chrootMounts[i])
+			} else if attempt == 1 {
+				// Вторая попытка: lazy размонтирование
+				cmd = exec.Command("umount", "-l", chrootMounts[i])
+			} else {
+				// Третья попытка: принудительное размонтирование
+				cmd = exec.Command("umount", "-f", chrootMounts[i])
+			}
+
+			if err := cmd.Run(); err == nil {
+				break // Успешно размонтировано
+			} else if attempt == 2 {
+				fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s after all attempts\n", chrootMounts[i])
+			}
+
+			// Небольшая пауза между попытками
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// После размонтирования внутренних точек, размонтируем основные точки
+	for i := len(j.mounts) - 1; i >= 0; i-- {
+		fmt.Fprintf(j.logWriter, "Unmounting %s...\n", j.mounts[i])
+
+		// Несколько попыток размонтирования
+		for attempt := 0; attempt < 3; attempt++ {
+			var cmd *exec.Cmd
+
+			if attempt == 0 {
+				cmd = exec.Command("umount", j.mounts[i])
+			} else if attempt == 1 {
+				cmd = exec.Command("umount", "-l", j.mounts[i])
+			} else {
+				cmd = exec.Command("umount", "-f", j.mounts[i])
+			}
+
+			if err := cmd.Run(); err == nil {
+				break
+			} else if attempt == 2 {
+				fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s after all attempts\n", j.mounts[i])
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	j.mounts = []string{}
 	j.running = false
+
+	// Проверка на оставшиеся loop-устройства
+	cleanupLoopDevices()
+
 	return nil
+}
+
+// findMountsInPath находит все точки монтирования внутри указанного пути
+func findMountsInPath(path string) ([]string, error) {
+	var mounts []string
+
+	// Чтение /proc/mounts
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, err
+	}
+
+	// Парсинг строк
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			mountPoint := fields[1]
+
+			// Проверяем, является ли точка монтирования дочерней по отношению к path
+			if strings.HasPrefix(mountPoint, path) {
+				mounts = append(mounts, mountPoint)
+			}
+		}
+	}
+
+	// Сортируем точки монтирования по длине пути (от самых длинных к коротким),
+	// чтобы сначала размонтировать вложенные точки
+	sort.Slice(mounts, func(i, j int) bool {
+		return len(mounts[i]) > len(mounts[j])
+	})
+
+	return mounts, nil
+}
+
+// cleanupLoopDevices освобождает все loop-устройства, которые могли быть забыты
+func cleanupLoopDevices() {
+	// Получаем список loop-устройств
+	cmd := exec.Command("losetup", "-l", "-n", "-O", "NAME")
+	output, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	// Отключаем каждое найденное loop-устройство
+	devices := strings.Split(string(output), "\n")
+	for _, device := range devices {
+		device = strings.TrimSpace(device)
+		if device != "" {
+			exec.Command("losetup", "-d", device).Run()
+		}
+	}
 }
 
 // IsRunning проверяет, выполнена ли изоляция
@@ -353,7 +474,7 @@ func (j *Jail) SetLogWriter(writer io.Writer) {
 	j.logWriter = writer
 }
 
-// ExecuteCommand выполняет команду в изолированной среде
+// ExecuteCommand выполняет команду в изолированной среде с живым выводом
 func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	j.mutex.Lock()
 	defer j.mutex.Unlock()
@@ -369,8 +490,65 @@ func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	cmdArgs := append([]string{j.config.ChrootDir, command}, args...)
 	cmd := exec.Command("chroot", cmdArgs...)
 
-	// Выполняем команду и возвращаем результат
-	return cmd.CombinedOutput()
+	// Создаем pipe для stdout и stderr
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	// Буфер для сбора всего вывода
+	var outputBuffer bytes.Buffer
+	outputMutex := &sync.Mutex{}
+
+	// Функция для обработки вывода из pipe
+	processOutput := func(reader io.Reader, prefix string) {
+		scanner := bufio.NewScanner(reader)
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			// Вывести строку в реальном времени
+			fmt.Fprintf(j.logWriter, "%s: %s\n", prefix, line)
+
+			// Сохранить строку в буфер
+			outputMutex.Lock()
+			outputBuffer.WriteString(line)
+			outputBuffer.WriteString("\n")
+			outputMutex.Unlock()
+		}
+	}
+
+	// Запускаем горутины для обработки stdout и stderr
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		processOutput(stdoutPipe, "stdout")
+	}()
+
+	go func() {
+		defer wg.Done()
+		processOutput(stderrPipe, "stderr")
+	}()
+
+	// Запускаем команду
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start command: %w", err)
+	}
+
+	// Ждем завершения команды
+	err = cmd.Wait()
+
+	// Ждем завершения обработки вывода
+	wg.Wait()
+
+	// Возвращаем собранный вывод и ошибку
+	return outputBuffer.Bytes(), err
 }
 
 // GetChrootDir возвращает путь к директории chroot
