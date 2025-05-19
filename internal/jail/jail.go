@@ -1,18 +1,14 @@
 package jail
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"sysweaver/internal/config"
 	"sysweaver/internal/structures"
@@ -86,8 +82,7 @@ func (j *Jail) setupMounts() error {
 		return fmt.Errorf("failed to create chroot directory: %w", err)
 	}
 
-	// Создаем временную директорию для общего монтирования
-	// Обе директории (upperdir и workdir) будут находиться в одной точке монтирования
+	// Создаем временную директорию для overlay
 	tmpMountBase := filepath.Join(os.TempDir(), "sysweaver-mount")
 
 	// Очищаем, если существует
@@ -97,7 +92,7 @@ func (j *Jail) setupMounts() error {
 		}
 	}
 
-	// Создаем временную базу и поддиректории
+	// Создаем временную базу и поддиректории для overlay
 	upperDir := filepath.Join(tmpMountBase, "upper")
 	workDir := filepath.Join(tmpMountBase, "work")
 
@@ -109,17 +104,7 @@ func (j *Jail) setupMounts() error {
 		return fmt.Errorf("failed to create work directory: %w", err)
 	}
 
-	// Копируем содержимое шаблона в upperDir
-	// Используем rsync или find+cp для копирования с сохранением прав
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("cp -a %s/* %s/ || true", j.config.TemplatePath, upperDir))
-	cmd.Stdout = j.logWriter
-	cmd.Stderr = j.logWriter
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(j.logWriter, "Warning: error copying template contents: %v\n", err)
-		// Продолжаем, даже если копирование не удалось полностью
-	}
-
-	// Монтируем overlay с обновленными параметрами
+	// Монтируем overlay с билдером как основой
 	overlayOptions := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
 		j.config.BuilderPath,
 		upperDir,
@@ -128,7 +113,7 @@ func (j *Jail) setupMounts() error {
 
 	fmt.Fprintf(j.logWriter, "Mounting overlay with options: %s\n", overlayOptions)
 
-	// Используем mount команду
+	// Используем mount команду для overlay
 	mountCmd := exec.Command("mount", "-t", "overlay", "overlay",
 		"-o", overlayOptions, j.config.ChrootDir)
 
@@ -173,6 +158,11 @@ func (j *Jail) setupMounts() error {
 		}
 
 		j.mounts = append(j.mounts, targetDir)
+	}
+
+	// Монтируем шаблон в специальные точки внутри chroot
+	if err := j.mountTemplate(); err != nil {
+		return fmt.Errorf("failed to mount template: %w", err)
 	}
 
 	// Дополнительные точки монтирования из конфигурации
@@ -228,6 +218,48 @@ func (j *Jail) setupMounts() error {
 	return nil
 }
 
+// mountTemplate монтирует компоненты шаблона в соответствующие точки
+func (j *Jail) mountTemplate() error {
+	templateMounts := []struct {
+		source string
+		target string
+		name   string
+	}{
+		{j.config.TemplatePath, "/template", "template root"},
+		{filepath.Join(j.config.TemplatePath, "scripts"), "/scripts", "template scripts"},
+	}
+
+	for _, tmpl := range templateMounts {
+		// Проверяем существование исходной директории
+		if _, err := os.Stat(tmpl.source); os.IsNotExist(err) {
+			fmt.Fprintf(j.logWriter, "Template directory %s not found, skipping %s\n", tmpl.source, tmpl.name)
+			continue
+		}
+
+		targetDir := filepath.Join(j.config.ChrootDir, tmpl.target)
+
+		// Создаем целевую директорию
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("failed to create template mount directory %s: %w", targetDir, err)
+		}
+
+		// Монтируем как bind mount
+		mountCmd := exec.Command("mount", "--bind", tmpl.source, targetDir)
+		mountCmd.Stdout = j.logWriter
+		mountCmd.Stderr = j.logWriter
+
+		if err := mountCmd.Run(); err != nil {
+			fmt.Fprintf(j.logWriter, "Warning: failed to bind mount %s: %v\n", tmpl.name, err)
+			continue
+		}
+
+		fmt.Fprintf(j.logWriter, "Successfully mounted %s to %s\n", tmpl.name, targetDir)
+		j.mounts = append(j.mounts, targetDir)
+	}
+
+	return nil
+}
+
 // Start запускает изолированную среду
 func (j *Jail) Start() error {
 	j.mutex.Lock()
@@ -245,8 +277,17 @@ func (j *Jail) Start() error {
 	// Создаем команду для chroot
 	j.cmd = exec.Command("/bin/ash")
 
-	// Настраиваем окружение
-	j.cmd.Env = j.config.Environment
+	// Настраиваем окружение - наследуем важные переменные хоста
+	hostEnv := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=/root",
+		"SHELL=/bin/ash",
+		"TERM=" + os.Getenv("TERM"),
+		"LANG=" + os.Getenv("LANG"),
+	}
+
+	// Добавляем переменные из конфигурации
+	j.cmd.Env = append(hostEnv, j.config.Environment...)
 
 	// Настраиваем I/O
 	j.cmd.Stdout = j.logWriter
@@ -297,22 +338,56 @@ func (j *Jail) Start() error {
 	return nil
 }
 
+// isMounted проверяет, смонтирован ли указанный путь
+func (j *Jail) isMounted(path string) bool {
+	// Читаем /proc/mounts для проверки
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+
+	// Проверяем, есть ли наш путь в списке монтирований
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == path {
+			return true
+		}
+	}
+
+	return false
+}
+
 // cleanup размонтирует все файловые системы
 func (j *Jail) cleanup() {
 	// Размонтируем в обратном порядке
 	for i := len(j.mounts) - 1; i >= 0; i-- {
-		umountCmd := exec.Command("umount", j.mounts[i])
+		mountPoint := j.mounts[i]
+
+		// Проверяем, смонтирован ли путь
+		if !j.isMounted(mountPoint) {
+			fmt.Fprintf(j.logWriter, "Path %s is not mounted, skipping\n", mountPoint)
+			continue
+		}
+
+		umountCmd := exec.Command("umount", mountPoint)
 		umountCmd.Stdout = j.logWriter
 		umountCmd.Stderr = j.logWriter
 
 		if err := umountCmd.Run(); err != nil {
-			fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s: %v\n", j.mounts[i], err)
+			fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s: %v\n", mountPoint, err)
+
+			// Пытаемся принудительно размонтировать
+			forceCmd := exec.Command("umount", "-f", mountPoint)
+			forceCmd.Stdout = j.logWriter
+			forceCmd.Stderr = j.logWriter
+			forceCmd.Run()
 		}
 	}
 	j.mounts = []string{}
 }
 
-// Stop останавливает изолированную среду и освобождает все ресурсы
+// Stop останавливает изолированную среду
 func (j *Jail) Stop() error {
 	j.mutex.Lock()
 	defer j.mutex.Unlock()
@@ -321,141 +396,24 @@ func (j *Jail) Stop() error {
 		return fmt.Errorf("jail is not running")
 	}
 
-	fmt.Fprintf(j.logWriter, "Cleaning up resources...\n")
-
 	// Останавливаем процесс
 	if j.cmd != nil && j.cmd.Process != nil {
 		if err := j.cmd.Process.Kill(); err != nil {
-			fmt.Fprintf(j.logWriter, "Warning: failed to kill process: %v\n", err)
+			return fmt.Errorf("failed to kill process: %w", err)
 		}
 
 		// Ждем завершения
 		if err := j.cmd.Wait(); err != nil {
-			fmt.Fprintf(j.logWriter, "Warning: error waiting for process to exit: %v\n", err)
+			// Игнорируем ошибку, так как процесс уже убит
+			fmt.Fprintf(j.logWriter, "Error waiting for process to exit: %v\n", err)
 		}
 	}
 
-	// Ищем все точки монтирования внутри chroot директории
-	chrootMounts, err := findMountsInPath(j.config.ChrootDir)
-	if err != nil {
-		fmt.Fprintf(j.logWriter, "Warning: error finding mounts in chroot: %v\n", err)
-	}
+	// Очищаем монтирование
+	j.cleanup()
 
-	// Размонтируем все найденные точки монтирования внутри chroot (в обратном порядке)
-	for i := len(chrootMounts) - 1; i >= 0; i-- {
-		fmt.Fprintf(j.logWriter, "Unmounting %s...\n", chrootMounts[i])
-
-		// Несколько попыток размонтирования с увеличением агрессивности
-		for attempt := 0; attempt < 3; attempt++ {
-			var cmd *exec.Cmd
-
-			if attempt == 0 {
-				// Первая попытка: обычное размонтирование
-				cmd = exec.Command("umount", chrootMounts[i])
-			} else if attempt == 1 {
-				// Вторая попытка: lazy размонтирование
-				cmd = exec.Command("umount", "-l", chrootMounts[i])
-			} else {
-				// Третья попытка: принудительное размонтирование
-				cmd = exec.Command("umount", "-f", chrootMounts[i])
-			}
-
-			if err := cmd.Run(); err == nil {
-				break // Успешно размонтировано
-			} else if attempt == 2 {
-				fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s after all attempts\n", chrootMounts[i])
-			}
-
-			// Небольшая пауза между попытками
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	// После размонтирования внутренних точек, размонтируем основные точки
-	for i := len(j.mounts) - 1; i >= 0; i-- {
-		fmt.Fprintf(j.logWriter, "Unmounting %s...\n", j.mounts[i])
-
-		// Несколько попыток размонтирования
-		for attempt := 0; attempt < 3; attempt++ {
-			var cmd *exec.Cmd
-
-			if attempt == 0 {
-				cmd = exec.Command("umount", j.mounts[i])
-			} else if attempt == 1 {
-				cmd = exec.Command("umount", "-l", j.mounts[i])
-			} else {
-				cmd = exec.Command("umount", "-f", j.mounts[i])
-			}
-
-			if err := cmd.Run(); err == nil {
-				break
-			} else if attempt == 2 {
-				fmt.Fprintf(j.logWriter, "Warning: failed to unmount %s after all attempts\n", j.mounts[i])
-			}
-
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	j.mounts = []string{}
 	j.running = false
-
-	// Проверка на оставшиеся loop-устройства
-	cleanupLoopDevices()
-
 	return nil
-}
-
-// findMountsInPath находит все точки монтирования внутри указанного пути
-func findMountsInPath(path string) ([]string, error) {
-	var mounts []string
-
-	// Чтение /proc/mounts
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		return nil, err
-	}
-
-	// Парсинг строк
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			mountPoint := fields[1]
-
-			// Проверяем, является ли точка монтирования дочерней по отношению к path
-			if strings.HasPrefix(mountPoint, path) {
-				mounts = append(mounts, mountPoint)
-			}
-		}
-	}
-
-	// Сортируем точки монтирования по длине пути (от самых длинных к коротким),
-	// чтобы сначала размонтировать вложенные точки
-	sort.Slice(mounts, func(i, j int) bool {
-		return len(mounts[i]) > len(mounts[j])
-	})
-
-	return mounts, nil
-}
-
-// cleanupLoopDevices освобождает все loop-устройства, которые могли быть забыты
-func cleanupLoopDevices() {
-	// Получаем список loop-устройств
-	cmd := exec.Command("losetup", "-l", "-n", "-O", "NAME")
-	output, err := cmd.Output()
-	if err != nil {
-		return
-	}
-
-	// Отключаем каждое найденное loop-устройство
-	devices := strings.Split(string(output), "\n")
-	for _, device := range devices {
-		device = strings.TrimSpace(device)
-		if device != "" {
-			exec.Command("losetup", "-d", device).Run()
-		}
-	}
 }
 
 // IsRunning проверяет, выполнена ли изоляция
@@ -474,7 +432,7 @@ func (j *Jail) SetLogWriter(writer io.Writer) {
 	j.logWriter = writer
 }
 
-// ExecuteCommand выполняет команду в изолированной среде с живым выводом
+// ExecuteCommand выполняет команду в изолированной среде с live выводом
 func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	j.mutex.Lock()
 	defer j.mutex.Unlock()
@@ -490,65 +448,16 @@ func (j *Jail) ExecuteCommand(command string, args ...string) ([]byte, error) {
 	cmdArgs := append([]string{j.config.ChrootDir, command}, args...)
 	cmd := exec.Command("chroot", cmdArgs...)
 
-	// Создаем pipe для stdout и stderr
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	// Настраиваем live вывод
+	cmd.Stdout = j.logWriter
+	cmd.Stderr = j.logWriter
+
+	// Выполняем команду с live выводом
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("command failed: %w", err)
 	}
 
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	// Буфер для сбора всего вывода
-	var outputBuffer bytes.Buffer
-	outputMutex := &sync.Mutex{}
-
-	// Функция для обработки вывода из pipe
-	processOutput := func(reader io.Reader, prefix string) {
-		scanner := bufio.NewScanner(reader)
-		for scanner.Scan() {
-			line := scanner.Text()
-
-			// Вывести строку в реальном времени
-			fmt.Fprintf(j.logWriter, "%s: %s\n", prefix, line)
-
-			// Сохранить строку в буфер
-			outputMutex.Lock()
-			outputBuffer.WriteString(line)
-			outputBuffer.WriteString("\n")
-			outputMutex.Unlock()
-		}
-	}
-
-	// Запускаем горутины для обработки stdout и stderr
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		processOutput(stdoutPipe, "stdout")
-	}()
-
-	go func() {
-		defer wg.Done()
-		processOutput(stderrPipe, "stderr")
-	}()
-
-	// Запускаем команду
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start command: %w", err)
-	}
-
-	// Ждем завершения команды
-	err = cmd.Wait()
-
-	// Ждем завершения обработки вывода
-	wg.Wait()
-
-	// Возвращаем собранный вывод и ошибку
-	return outputBuffer.Bytes(), err
+	return nil, nil
 }
 
 // GetChrootDir возвращает путь к директории chroot
