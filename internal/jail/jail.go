@@ -220,149 +220,94 @@ func (j *Jail) setupMounts() error {
 
 // mountTemplate монтирует компоненты шаблона в соответствующие точки
 func (j *Jail) mountTemplate() error {
-	templateMounts := []struct {
-		source   string
-		target   string
-		name     string
-		writable bool // Нужна ли запись в эту директорию
-	}{
-		{j.config.TemplatePath, "/template", "template root", false},
-		{filepath.Join(j.config.TemplatePath, "scripts"), "/scripts", "template scripts", false},
+	// Важно: проверяем существование шаблона
+	if _, err := os.Stat(j.config.TemplatePath); os.IsNotExist(err) {
+		return fmt.Errorf("template path does not exist: %s", j.config.TemplatePath)
 	}
 
-	for _, tmpl := range templateMounts {
-		// Проверяем существование исходной директории
-		if _, err := os.Stat(tmpl.source); os.IsNotExist(err) {
-			fmt.Fprintf(j.logWriter, "Template directory %s not found, skipping %s\n", tmpl.source, tmpl.name)
-			continue
-		}
+	// Логируем путь к шаблону для диагностики
+	fmt.Fprintf(j.logWriter, "Mounting template from: %s\n", j.config.TemplatePath)
 
-		targetDir := filepath.Join(j.config.ChrootDir, tmpl.target)
+	// Определяем точки монтирования внутри chroot
+	templateMount := filepath.Join(j.config.ChrootDir, "template")
+	scriptsMount := filepath.Join(j.config.ChrootDir, "scripts")
 
-		// Создаем целевую директорию
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
-			return fmt.Errorf("failed to create template mount directory %s: %w", targetDir, err)
-		}
-
-		// Монтируем как bind mount с правильными опциями
-		var mountCmd *exec.Cmd
-		if tmpl.writable {
-			// Для записываемых директорий - обычный bind mount
-			mountCmd = exec.Command("mount", "--bind", tmpl.source, targetDir)
-		} else {
-			// Для читаемых директорий - read-only bind mount
-			mountCmd = exec.Command("mount", "--bind", tmpl.source, targetDir)
-		}
-
-		mountCmd.Stdout = j.logWriter
-		mountCmd.Stderr = j.logWriter
-
-		if err := mountCmd.Run(); err != nil {
-			fmt.Fprintf(j.logWriter, "Warning: failed to bind mount %s: %v\n", tmpl.name, err)
-			continue
-		}
-
-		// Для read-only директорий добавляем remount с ro опцией
-		if !tmpl.writable {
-			remountCmd := exec.Command("mount", "-o", "remount,ro,bind", targetDir)
-			remountCmd.Stdout = j.logWriter
-			remountCmd.Stderr = j.logWriter
-
-			if err := remountCmd.Run(); err != nil {
-				fmt.Fprintf(j.logWriter, "Warning: failed to remount %s as read-only: %v\n", tmpl.name, err)
-			}
-		}
-
-		fmt.Fprintf(j.logWriter, "Successfully mounted %s to %s\n", tmpl.name, targetDir)
-		j.mounts = append(j.mounts, targetDir)
+	// Создаем директории для монтирования
+	if err := os.MkdirAll(templateMount, 0755); err != nil {
+		return fmt.Errorf("failed to create template mount directory: %w", err)
+	}
+	if err := os.MkdirAll(scriptsMount, 0755); err != nil {
+		return fmt.Errorf("failed to create scripts mount directory: %w", err)
 	}
 
-	// Дополнительно: копируем содержимое шаблона в upperdir для записи
-	// Это позволит скриптам изменять скопированные файлы без проблем с правами
-	return j.copyTemplateToUpper()
-}
-
-// copyTemplateToUpper копирует содержимое шаблона в upper слой overlay
-func (j *Jail) copyTemplateToUpper() error {
-	// Находим upper директорию в текущих mount'ах
-	upperDir := ""
-
-	// Читаем /proc/mounts чтобы найти overlay с нашим chroot
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		return fmt.Errorf("failed to read /proc/mounts: %w", err)
+	// Монтируем корень шаблона В РЕЖИМЕ ТОЛЬКО ДЛЯ ЧТЕНИЯ
+	fmt.Fprintf(j.logWriter, "Mounting template root to %s (read-only)\n", templateMount)
+	mountCmd := exec.Command("mount", "--bind", j.config.TemplatePath, templateMount)
+	mountCmd.Stdout = j.logWriter
+	mountCmd.Stderr = j.logWriter
+	if err := mountCmd.Run(); err != nil {
+		return fmt.Errorf("failed to mount template root: %w", err)
 	}
 
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[1] == j.config.ChrootDir && fields[2] == "overlay" {
-			// Парсим опции overlay
-			options := strings.Split(fields[3], ",")
-			for _, opt := range options {
-				if strings.HasPrefix(opt, "upperdir=") {
-					upperDir = strings.TrimPrefix(opt, "upperdir=")
-					break
-				}
-			}
-			break
+	// ВАЖНО: Делаем шаблон read-only с помощью remount
+	remountCmd := exec.Command("mount", "-o", "remount,ro,bind", templateMount)
+	remountCmd.Stdout = j.logWriter
+	remountCmd.Stderr = j.logWriter
+	if err := remountCmd.Run(); err != nil {
+		return fmt.Errorf("failed to remount template as read-only: %w", err)
+	}
+
+	j.mounts = append(j.mounts, templateMount)
+
+	// Проверяем существование scripts директории в шаблоне
+	scriptsSrc := filepath.Join(j.config.TemplatePath, "scripts")
+	if _, err := os.Stat(scriptsSrc); os.IsNotExist(err) {
+		// Создаем пустую директорию для скриптов если их нет
+		if err := os.MkdirAll(scriptsSrc, 0755); err != nil {
+			return fmt.Errorf("failed to create scripts directory in template: %w", err)
 		}
 	}
 
-	if upperDir == "" {
-		return fmt.Errorf("could not find upperdir for overlay")
+	// Монтируем директорию скриптов В РЕЖИМЕ ТОЛЬКО ДЛЯ ЧТЕНИЯ
+	fmt.Fprintf(j.logWriter, "Mounting scripts directory to %s (read-only)\n", scriptsMount)
+	scriptsCmd := exec.Command("mount", "--bind", scriptsSrc, scriptsMount)
+	scriptsCmd.Stdout = j.logWriter
+	scriptsCmd.Stderr = j.logWriter
+	if err := scriptsCmd.Run(); err != nil {
+		return fmt.Errorf("failed to mount scripts directory: %w", err)
 	}
 
-	// Копируем содержимое template/root в upperdir, изменяя владельца на текущего пользователя
-	templateRoot := filepath.Join(j.config.TemplatePath, "root")
-	if _, err := os.Stat(templateRoot); err == nil {
-		fmt.Fprintf(j.logWriter, "Copying template root to upper layer...\n")
-
-		// Используем rsync для копирования с правильными правами
-		rsyncCmd := exec.Command("rsync", "-av", "--chown="+fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), templateRoot+"/", upperDir+"/")
-		rsyncCmd.Stdout = j.logWriter
-		rsyncCmd.Stderr = j.logWriter
-
-		if err := rsyncCmd.Run(); err != nil {
-			// Если rsync не удался, пробуем обычное копирование
-			fmt.Fprintf(j.logWriter, "Rsync failed, trying cp...\n")
-			cpCmd := exec.Command("cp", "-a", templateRoot+"/.", upperDir+"/")
-			cpCmd.Stdout = j.logWriter
-			cpCmd.Stderr = j.logWriter
-
-			if err := cpCmd.Run(); err != nil {
-				return fmt.Errorf("failed to copy template root: %w", err)
-			}
-		}
+	// ВАЖНО: Делаем скрипты read-only с помощью remount
+	remountScriptsCmd := exec.Command("mount", "-o", "remount,ro,bind", scriptsMount)
+	remountScriptsCmd.Stdout = j.logWriter
+	remountScriptsCmd.Stderr = j.logWriter
+	if err := remountScriptsCmd.Run(); err != nil {
+		return fmt.Errorf("failed to remount scripts as read-only: %w", err)
 	}
 
-	// Копируем содержимое template/boot, если оно есть
-	templateBoot := filepath.Join(j.config.TemplatePath, "boot")
-	if _, err := os.Stat(templateBoot); err == nil {
-		fmt.Fprintf(j.logWriter, "Copying template boot to upper layer...\n")
+	j.mounts = append(j.mounts, scriptsMount)
 
-		upperBoot := filepath.Join(upperDir, "boot")
-		if err := os.MkdirAll(upperBoot, 0755); err != nil {
-			return fmt.Errorf("failed to create boot directory in upper: %w", err)
-		}
+	// ВАЖНО: Проверяем что шаблон действительно смонтирован И ЗАЩИЩЕН (read-only)
+	tempFile := filepath.Join(templateMount, "test_readonly.tmp")
+	touchCmd := exec.Command("touch", tempFile)
+	touchOutput, touchErr := touchCmd.CombinedOutput()
 
-		// Используем rsync для boot файлов
-		rsyncCmd := exec.Command("rsync", "-av", "--chown="+fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), templateBoot+"/", upperBoot+"/")
-		rsyncCmd.Stdout = j.logWriter
-		rsyncCmd.Stderr = j.logWriter
-
-		if err := rsyncCmd.Run(); err != nil {
-			// Если rsync не удался, пробуем обычное копирование
-			fmt.Fprintf(j.logWriter, "Rsync failed for boot, trying cp...\n")
-			cpCmd := exec.Command("cp", "-a", templateBoot+"/.", upperBoot+"/")
-			cpCmd.Stdout = j.logWriter
-			cpCmd.Stderr = j.logWriter
-
-			if err := cpCmd.Run(); err != nil {
-				fmt.Fprintf(j.logWriter, "Warning: failed to copy template boot: %v\n", err)
-			}
-		}
+	// Если мы смогли создать файл - значит шаблон НЕ read-only!
+	if touchErr == nil {
+		// Критическая ошибка! Шаблон монтирован с правами на запись!
+		return fmt.Errorf("CRITICAL ERROR: template is mounted as writable! This must never happen")
 	}
+
+	// Убедимся что ошибка именно из-за read-only ФС
+	errStr := string(touchOutput)
+	if !strings.Contains(errStr, "Read-only") && !strings.Contains(errStr, "read-only") {
+		fmt.Fprintf(j.logWriter, "Template protection test failed with unexpected error: %s\n", errStr)
+	} else {
+		fmt.Fprintf(j.logWriter, "Template protection verified: mounted as read-only\n")
+	}
+
+	// Логируем завершение монтирования шаблона
+	fmt.Fprintf(j.logWriter, "Template mounted successfully\n")
 
 	return nil
 }
@@ -476,7 +421,7 @@ func (j *Jail) isMounted(path string) bool {
 	return false
 }
 
-// cleanup размонтирует все файловые системы
+// cleanup размонтирует все файловые системы и восстанавливает системные устройства
 func (j *Jail) cleanup() {
 	fmt.Fprintf(j.logWriter, "Starting cleanup process...\n")
 
@@ -546,6 +491,33 @@ func (j *Jail) cleanup() {
 				fmt.Fprintf(j.logWriter, "Found remaining mount: %s, force unmounting...\n", mount)
 				exec.Command("umount", "-f", mount).Run()
 				exec.Command("umount", "-l", mount).Run()
+			}
+		}
+	}
+
+	// ВАЖНО: восстановить права на /dev/null и другие устройства
+	fmt.Fprintf(j.logWriter, "Restoring system device permissions...\n")
+
+	// Проверяем права на /dev/null
+	nullInfo, _ := os.Stat("/dev/null")
+	if nullInfo != nil {
+		mode := nullInfo.Mode()
+		if mode&0666 != 0666 {
+			// Права не 666, исправляем
+			fmt.Fprintf(j.logWriter, "Fixing /dev/null permissions...\n")
+			exec.Command("chmod", "666", "/dev/null").Run()
+		}
+	}
+
+	// Проверяем другие ключевые устройства
+	devices := []string{"/dev/zero", "/dev/random", "/dev/urandom"}
+	for _, dev := range devices {
+		devInfo, _ := os.Stat(dev)
+		if devInfo != nil {
+			mode := devInfo.Mode()
+			if mode&0666 != 0666 {
+				fmt.Fprintf(j.logWriter, "Fixing %s permissions...\n", dev)
+				exec.Command("chmod", "666", dev).Run()
 			}
 		}
 	}

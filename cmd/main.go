@@ -261,61 +261,6 @@ The template should contain all necessary scripts and configurations.`,
 
 		fmt.Println("\n✅ All installation scripts completed successfully!")
 
-		if manual {
-			// Если включен ручной режим, даем пользователю возможность войти в jail
-			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
-
-			// Запускаем интерактивную оболочку
-			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
-			shellCmd.Stdin = os.Stdin
-			shellCmd.Stdout = os.Stdout
-			shellCmd.Stderr = os.Stderr
-
-			if err := shellCmd.Run(); err != nil {
-				fmt.Printf("Error in interactive shell: %v\n", err)
-			}
-
-			fmt.Println("Exited from manual mode, continuing with image copying...")
-		}
-
-		fmt.Println("\n✅ All installation scripts completed successfully!")
-
-		if manual {
-			// Если включен ручной режим, даем пользователю возможность войти в jail
-			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
-
-			// Запускаем интерактивную оболочку
-			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
-			shellCmd.Stdin = os.Stdin
-			shellCmd.Stdout = os.Stdout
-			shellCmd.Stderr = os.Stderr
-
-			if err := shellCmd.Run(); err != nil {
-				fmt.Printf("Error in interactive shell: %v\n", err)
-			}
-
-			fmt.Println("Exited from manual mode, continuing with image copying...")
-		}
-
-		fmt.Println("\n✅ All installation scripts completed successfully!")
-
-		if manual {
-			// Если включен ручной режим, даем пользователю возможность войти в jail
-			fmt.Println("\nEntering manual mode. Type 'exit' to quit and continue.")
-
-			// Запускаем интерактивную оболочку
-			shellCmd := exec.Command("sudo", "chroot", j.GetChrootDir(), "/bin/sh")
-			shellCmd.Stdin = os.Stdin
-			shellCmd.Stdout = os.Stdout
-			shellCmd.Stderr = os.Stderr
-
-			if err := shellCmd.Run(); err != nil {
-				fmt.Printf("Error in interactive shell: %v\n", err)
-			}
-
-			fmt.Println("Exited from manual mode, continuing with image copying...")
-		}
-
 		// Копируем готовые образы из chroot в указанную директорию вывода
 		fmt.Println("\nCopying built images from jail...")
 

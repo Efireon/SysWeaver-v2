@@ -12,4 +12,7 @@ run:
 
 	bin/sysweaver
 
+clr-out:
+	rm -rf output/*
+
 build-run: build run
